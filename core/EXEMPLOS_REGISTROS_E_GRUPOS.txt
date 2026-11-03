@@ -1,0 +1,300 @@
+EXEMPLOS DE REGISTRO E GERENCIAMENTO DE GRUPOS (DJANGO + DRF)
+===============================================================
+
+Este arquivo é um GUIA com códigos para copiar/adaptar quando precisar.
+NÃO é importado pela aplicação e NÃO altera o funcionamento atual da API.
+
+REFERÊNCIA AO TEMPLATE ATUAL
+- Modelo de usuário: core.models.User
+- Serializer de cadastro existente: core.serializers.user.UserRegistrationSerializer
+- Cadastro atual: POST /api/registro/
+- Perfil: /api/usuarios/me/ (não permite mudar grupos)
+- Política global: DjangoModelPermissionsOrAnonReadOnly
+- A associação a grupos e as permissões do Django NÃO devem ser controladas
+  por um campo enviado em um cadastro público.
+
+ANTES DE COMEÇAR
+1. Execute: pdm run migrate
+2. Entre em /admin/ e crie os grupos "Cliente" e "Funcionário".
+3. No Admin > Grupos, conceda somente as permissões necessárias a cada grupo.
+4. Os trechos abaixo são exemplos ALTERNATIVOS. Não é obrigatório usar
+   todas as abordagens ao mesmo tempo.
+
+
+===============================================================
+FUNÇÃO 1 — DEFINIR UM GRUPO PADRÃO NO SERIALIZER DE REGISTRO
+===============================================================
+Objetivo: todo cadastro pela rota existente /api/registro/ entra em "Cliente".
+
+No arquivo core/serializers/user.py, adicione os imports e SUBSTITUA
+somente o método create() de UserRegistrationSerializer:
+
+    from django.contrib.auth.models import Group
+    from django.db import transaction
+
+    # Dentro da classe UserRegistrationSerializer:
+    @transaction.atomic
+    def create(self, validated_data):
+        grupo_cliente = Group.objects.get(name='Cliente')
+        user = User.objects.create_user(**validated_data)
+        user.groups.add(grupo_cliente)
+        return user
+
+Observações:
+- O grupo "Cliente" deve existir no Django Admin antes do cadastro.
+- Se não existir, Group.DoesNotExist será lançado; a transação evita
+  salvar um usuário pela metade.
+- O frontend NÃO informa o grupo no JSON do registro.
+- Se quiser dois tipos de cadastro, use a FUNÇÃO 2 no lugar desta abordagem.
+
+
+===============================================================
+FUNÇÃO 2 — CRIAR DOIS REGISTROS: CLIENTE E FUNCIONÁRIO
+===============================================================
+Objetivo:
+  POST /api/registro/cliente/       -> grupo "Cliente" (público)
+  POST /api/registro/funcionario/   -> grupo "Funcionário" (restrito)
+
+Crie core/permissions.py:
+
+    from rest_framework.permissions import BasePermission
+
+    class IsSuperuser(BasePermission):
+        message = 'Apenas superusuários podem realizar esta ação.'
+
+        def has_permission(self, request, view):
+            return bool(
+                request.user
+                and request.user.is_authenticated
+                and request.user.is_superuser
+            )
+
+Crie core/views/registro_exemplos.py:
+
+    from django.contrib.auth.models import Group
+    from django.db import transaction
+    from rest_framework.generics import CreateAPIView
+    from rest_framework.permissions import AllowAny
+
+    from core.models import User
+    from core.permissions import IsSuperuser
+    from core.serializers.user import UserRegistrationSerializer
+
+    class ClienteRegistrationView(CreateAPIView):
+        queryset = User.objects.all()
+        serializer_class = UserRegistrationSerializer
+        permission_classes = [AllowAny]
+
+        @transaction.atomic
+        def perform_create(self, serializer):
+            grupo = Group.objects.get(name='Cliente')
+            user = serializer.save()
+            user.groups.add(grupo)
+
+    class FuncionarioRegistrationView(CreateAPIView):
+        queryset = User.objects.all()
+        serializer_class = UserRegistrationSerializer
+        permission_classes = [IsSuperuser]
+
+        @transaction.atomic
+        def perform_create(self, serializer):
+            grupo = Group.objects.get(name='Funcionário')
+            user = serializer.save()
+            user.groups.add(grupo)
+
+No app/urls.py, adicione estes imports:
+
+    from core.views.registro_exemplos import (
+        ClienteRegistrationView,
+        FuncionarioRegistrationView,
+    )
+
+E adicione estas rotas em urlpatterns:
+
+    path('api/registro/cliente/', ClienteRegistrationView.as_view()),
+    path('api/registro/funcionario/', FuncionarioRegistrationView.as_view()),
+
+Importante:
+- Restrinja a rota de Funcionário. Nunca deixe esse cadastro como AllowAny.
+- Aqui usei IsSuperuser, mais restritivo do que IsAdminUser, pois qualquer
+  usuário com is_staff=True passa em IsAdminUser.
+- O serializer de registro continua validando e-mail, username e senha.
+- A rota original /api/registro/ continua existindo; adapte ou remova
+  essa rota conforme o fluxo desejado, para não criar cadastros sem grupo.
+
+
+===============================================================
+FUNÇÃO 3 — TROCAR TODOS OS GRUPOS DE UM USUÁRIO (PATCH OU PUT)
+===============================================================
+Objetivo: um superusuário escolhe a lista COMPLETA de grupos do usuário.
+
+Crie core/serializers/grupos_exemplo.py:
+
+    from django.contrib.auth.models import Group
+    from rest_framework import serializers
+    from core.models import User
+
+    class UserGroupSerializer(serializers.ModelSerializer):
+        groups = serializers.PrimaryKeyRelatedField(
+            queryset=Group.objects.all(),
+            many=True,
+        )
+
+        class Meta:
+            model = User
+            fields = ['id', 'username', 'groups']
+            read_only_fields = ['id', 'username']
+
+Crie core/views/grupos_exemplo.py:
+
+    from rest_framework.generics import UpdateAPIView
+    from core.models import User
+    from core.permissions import IsSuperuser
+    from core.serializers.grupos_exemplo import UserGroupSerializer
+
+    class UserGroupUpdateView(UpdateAPIView):
+        queryset = User.objects.all()
+        serializer_class = UserGroupSerializer
+        permission_classes = [IsSuperuser]
+        http_method_names = ['patch', 'put']
+
+No app/urls.py, adicione:
+
+    from core.views.grupos_exemplo import UserGroupUpdateView
+
+    path(
+        'api/usuarios/<int:pk>/grupos/',
+        UserGroupUpdateView.as_view(),
+    ),
+
+Exemplo: PATCH /api/usuarios/5/grupos/
+Authorization: Bearer TOKEN_DE_SUPERUSUARIO
+Content-Type: application/json
+
+    {"groups": [2]}
+
+Comportamento:
+- PATCH com "groups" SUBSTITUI a lista atual (não adiciona).
+- PUT exige os campos editáveis necessários para a representação completa;
+  aqui "groups" é o campo editável obrigatório.
+- {"groups": []} remove todos os grupos.
+- Os IDs dos grupos são os IDs reais do seu banco.
+- A senha, is_staff, is_superuser e user_permissions não são alterados.
+- Não use esse serializer no endpoint público de cadastro ou no /me/.
+
+
+===============================================================
+FUNÇÃO 4 — ADICIONAR UM GRUPO SEM REMOVER OS EXISTENTES
+===============================================================
+Objetivo: adicionar "Funcionário" e manter "Cliente", por exemplo.
+
+No core/views/grupos_exemplo.py, adicione:
+
+    from django.contrib.auth.models import Group
+    from django.shortcuts import get_object_or_404
+    from rest_framework import status
+    from rest_framework.response import Response
+    from rest_framework.views import APIView
+
+    class AdicionarGrupoView(APIView):
+        permission_classes = [IsSuperuser]
+
+        def post(self, request, pk, group_id):
+            usuario = get_object_or_404(User, pk=pk)
+            grupo = get_object_or_404(Group, pk=group_id)
+            usuario.groups.add(grupo)
+            return Response({'message': 'Grupo adicionado.'}, status=status.HTTP_200_OK)
+
+Em app/urls.py, adicione:
+
+    from core.views.grupos_exemplo import AdicionarGrupoView
+
+    path(
+        'api/usuarios/<int:pk>/grupos/<int:group_id>/adicionar/',
+        AdicionarGrupoView.as_view(),
+    ),
+
+Exemplo:
+    POST /api/usuarios/5/grupos/2/adicionar/
+
+É uma operação administrativa e não um cadastro público.
+
+
+===============================================================
+FUNÇÃO 5 — REMOVER APENAS UM GRUPO
+===============================================================
+Objetivo: remover "Cliente" mas manter os outros grupos.
+
+No core/views/grupos_exemplo.py, adicione:
+
+    class RemoverGrupoView(APIView):
+        permission_classes = [IsSuperuser]
+
+        def delete(self, request, pk, group_id):
+            usuario = get_object_or_404(User, pk=pk)
+            grupo = get_object_or_404(Group, pk=group_id)
+            usuario.groups.remove(grupo)
+            return Response(status=status.HTTP_204_NO_CONTENT)
+
+Em app/urls.py, adicione:
+
+    from core.views.grupos_exemplo import RemoverGrupoView
+
+    path(
+        'api/usuarios/<int:pk>/grupos/<int:group_id>/remover/',
+        RemoverGrupoView.as_view(),
+    ),
+
+Exemplo:
+    DELETE /api/usuarios/5/grupos/2/remover/
+
+
+===============================================================
+FUNÇÃO 6 — COMO AS PERMISSÕES DOS GRUPOS FUNCIONAM
+===============================================================
+Exemplo de grupo "Cliente":
+    view_livro    (opcional: o GET já é público na política global)
+    add_pedido
+
+Exemplo de grupo "Funcionário":
+    add_livro
+    change_livro
+
+Exemplo de grupo "Gerente":
+    add_livro
+    change_livro
+    delete_livro
+
+Com DjangoModelPermissionsOrAnonReadOnly como permissão global:
+- GET em endpoints que usam a permissão global: liberado sem login.
+- POST: requer usuário autenticado + add_<modelo>.
+- PUT e PATCH: requer usuário autenticado + change_<modelo>.
+- DELETE: requer usuário autenticado + delete_<modelo>.
+
+Atenção:
+- As views precisam ter queryset ou get_queryset() para as permissões
+  de modelo funcionarem corretamente.
+- Views com permission_classes próprios substituem a política global.
+- O UserViewSet e o uploader do template continuam protegidos.
+- O grupo "Uploaders de Mídia" já existe no template após migrate e
+  permite enviar/consultar mídia conforme as permissões que possui.
+- Para dados pessoais, use endpoints privados; jamais exponha listas
+  de usuários ou dados sigilosos por um GET público.
+
+
+===============================================================
+RESUMO: QUAL TRECHO USAR?
+===============================================================
+FUNÇÃO 1: um cadastro público, sempre no grupo Cliente.
+FUNÇÃO 2: cadastros diferentes, cada um com grupo e acesso próprios.
+FUNÇÃO 3: substituir grupos existentes via PATCH/PUT administrativo.
+FUNÇÃO 4: acrescentar um grupo, sem apagar os anteriores.
+FUNÇÃO 5: retirar apenas um grupo específico.
+FUNÇÃO 6: consultar como o Django/DRF aplicam as permissões.
+
+SEGURANÇA: os exemplos que atribuem grupos elevados usam IsSuperuser.
+Se você criar permissões administrativas delegadas, proteja contra
+autoelevação e alteração de grupos acima do nível de acesso do operador.
+
+Este arquivo é um material de referência: não foi conectado às URLs,
+views ou serializers reais do template.
